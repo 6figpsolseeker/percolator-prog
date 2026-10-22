@@ -3488,3 +3488,162 @@ fn gh561_resolved_bond_payout_is_not_netted_by_a_residual_backstop() {
     let st = state::read_vault_lp_state(&env.svm.get_account(&env.vault_lp).unwrap().data).unwrap();
     assert_eq!(st.backstop_outstanding_atoms, 3_500 * U, "vacuity: the residual exceeded the junior cushion during the exit");
 }
+
+// ── GH#571: 108 / 110 in a quiet stretch must not forfeit the coupon accrued since the last 78 ──
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Quiet571 {
+    Control,
+    Dust108,
+    Repeat108,
+    Exec110,
+    Farm108,
+}
+
+struct Out571 {
+    coupon: u128,
+    leg: u128,
+    t0: u64,
+    t_act: u64,
+    t2: u64,
+    ckpt: u64,
+    c_old: u128,
+    c_b: u128,
+    b: u128,
+    f_shares: u128,
+}
+
+/// 78 at t0 (fat leg); the holder requests 1 share; a 500k-slot quiet stretch (78 refused: no
+/// fees) ending with action `w` one slot before trading resumes; then the next fat-leg 78.
+fn quiet_stretch_571(w: Quiet571) -> (Env, Lp, BondHolder, Out571) {
+    let (mut env, lp, _d, h) = bond_world(Params { fee_bps: 100, ..Params::default() }, 10_000, 3_000, 3_000, 2_000);
+    let t = env.new_trader(10_000 * U);
+    let round = |env: &mut Env| {
+        for _ in 0..6 {
+            env.trade(&t, &lp, 1_000 * UQ).expect("open");
+            env.trade(&t, &lp, -1_000 * UQ).expect("close");
+        }
+    };
+    env.hold(1, &[lp.portfolio]);
+    round(&mut env);
+    env.crank_fees_bond(lp.portfolio).expect("78 at t0");
+    let t0 = env.slot;
+    env.bond_request(&h, 1).expect("109 one share");
+    env.slot += 500_000 - 2;
+    env.svm.warp_to_slot(env.slot);
+    env.hold(1, &[lp.portfolio]);
+    err_has(&env.crank_fees_bond(lp.portfolio), PercolatorError::LpVaultNoFeesToCrank);
+    let f = env.new_bond_holder();
+    let c_old = env.tranche().c_b_atoms;
+    let dust = |env: &mut Env| {
+        (1u64..=100).find(|&a| env.bond_deposit(&f, lp.portfolio, a, 1).is_ok()).expect("a dust 108 is admitted")
+    };
+    match w {
+        Quiet571::Control => {}
+        Quiet571::Dust108 => {
+            dust(&mut env);
+        }
+        Quiet571::Repeat108 => {
+            for _ in 0..20 {
+                dust(&mut env);
+                env.hold(1, &[lp.portfolio]);
+            }
+        }
+        Quiet571::Exec110 => {
+            env.bond_execute(&h, lp.portfolio, 0).expect("110 one share");
+        }
+        Quiet571::Farm108 => {
+            env.bond_deposit(&f, lp.portfolio, 3_000 * U, 1).expect("farm 108");
+            let s = env.bond_pos(&f).shares;
+            env.bond_request(&f, s).expect("farmer 109 at once");
+        }
+    }
+    let t_act = env.slot;
+    let tr = env.tranche();
+    env.hold(1, &[lp.portfolio]);
+    round(&mut env);
+    let leg = {
+        let (cfg, _) = env.market_state();
+        cfg.lp_fee_accrued_atoms - cfg.lp_fee_withdrawn_atoms
+    };
+    env.crank_fees_bond(lp.portfolio).expect("78 at t2");
+    let coupon = env.tranche().c_b_atoms - tr.c_b_atoms;
+    let f_shares = match env.svm.get_account(&f.position) {
+        Some(a) if !a.data.is_empty() => env.bond_pos(&f).shares,
+        _ => 0,
+    };
+    let o = Out571 { coupon, leg, t0, t_act, t2: env.slot, ckpt: tr.last_coupon_slot, c_old, c_b: tr.c_b_atoms, b: tr.b_shares_total, f_shares };
+    eprintln!(
+        "GH571 {w:?}: t0={} t_act={} t2={} ckpt={} c_old={} c_b={} leg={} coupon={} f_shares={} B={}",
+        o.t0, o.t_act, o.t2, o.ckpt, o.c_old, o.c_b, o.leg, o.coupon, o.f_shares, o.b
+    );
+    env.assert_conserved("gh571");
+    (env, lp, f, o)
+}
+
+/// The coupon tag 78 must pay off the stored checkpoint (fat leg: never capped here).
+fn due_571(o: &Out571) -> u128 {
+    let due = bond_v20::coupon_due(o.c_b, 2_000, o.t2 - o.ckpt).unwrap();
+    assert!(due < o.leg / 2, "vacuity: the leg cap does not bind");
+    due
+}
+
+/// GH#571: a dust 108 (once, or every slot) in a quiet stretch leaves the checkpoint at the last
+/// harvest, so the next 78 pays the whole interval. Unpatched (reset to now): coupon 7 of 3.8M.
+#[test]
+fn gh571_dust_108_keeps_the_idle_coupon() {
+    let (_, _, _, c) = quiet_stretch_571(Quiet571::Control);
+    assert!(c.coupon > 1_000_000 && c.coupon == due_571(&c) && c.ckpt == c.t0, "vacuity: control pays the interval");
+    for w in [Quiet571::Dust108, Quiet571::Repeat108] {
+        let (_, _, _, o) = quiet_stretch_571(w);
+        assert!(o.c_b > o.c_old, "vacuity: the deposit landed");
+        assert_eq!(o.ckpt, o.t0, "{w:?}: a dust deposit does not move the checkpoint");
+        assert_eq!(o.coupon, due_571(&o));
+        assert!(o.coupon >= c.coupon, "{w:?}: nothing forfeited");
+    }
+}
+
+/// GH#571: a 1-share 110 in a quiet stretch leaves the checkpoint alone; the remaining holders
+/// are paid the whole interval on the remaining claim. Unpatched: coupon 7.
+#[test]
+fn gh571_one_share_110_keeps_the_idle_coupon() {
+    let (_, _, _, c) = quiet_stretch_571(Quiet571::Control);
+    let (_, _, _, o) = quiet_stretch_571(Quiet571::Exec110);
+    assert!(o.c_b < o.c_old, "vacuity: the exit landed");
+    assert_eq!(o.ckpt, o.t0, "110 does not move the checkpoint");
+    assert_eq!(o.coupon, due_571(&o));
+    assert!(o.coupon + 1 >= c.coupon * o.c_b / c.c_b, "remaining holders keep their own accrual");
+}
+
+/// GH#571: a large 108 just before trading resumes moves the checkpoint by exactly its weight:
+/// the seniors pay only time-weighted capital (the newcomer accrues from entry, no farming at
+/// the seniors' expense), and the incumbents keep at least `C_old / C_new` of their accrual
+/// (unpatched: all but one slot forfeited). The residual is pooled-share dilution: the newcomer
+/// shares the incumbents' unpaid accrual pro rata, bounded by that accrual (measured below).
+#[test]
+fn gh571_large_108_moves_the_checkpoint_by_its_weight() {
+    let (_, _, _, c) = quiet_stretch_571(Quiet571::Control);
+    let (mut env, lp, f, o) = quiet_stretch_571(Quiet571::Farm108);
+    let dt = (o.t_act - o.t0) as u128;
+    let kept = (o.c_old * dt).div_ceil(o.c_b) as u64;
+    assert_eq!(o.ckpt, o.t_act - kept, "checkpoint = now - ceil(C_old * dt / C_new)");
+    assert_eq!(o.coupon, due_571(&o));
+    let own = bond_v20::coupon_due(o.c_b - o.c_old, 2_000, o.t2 - o.t_act).unwrap();
+    // ceil rounding keeps < 1 slot of C_new accrual for the incumbents
+    let slot = bond_v20::coupon_due(o.c_b, 2_000, 1).unwrap();
+    assert!(o.coupon <= c.coupon + own + slot + 1, "seniors pay no pre-entry coupon on the new capital");
+    // contrast: leaving the checkpoint alone on 108 would pay the newcomer's pre-entry accrual
+    let no_shift = bond_v20::coupon_due(o.c_b, 2_000, o.t2 - o.t0).unwrap();
+    assert!(no_shift > o.coupon + 100_000, "vacuity: the shift binds ({no_shift} vs {})", o.coupon);
+    let incumbents = o.coupon * (o.b - o.f_shares) / o.b;
+    assert!(incumbents + 1 >= c.coupon * o.c_old / o.c_b, "incumbents keep C_old/C_new of their accrual");
+    // the sandwich completed: 109 at entry, 110 after the cooldown
+    env.slot += COOLDOWN as u64;
+    env.svm.warp_to_slot(env.slot);
+    env.hold(1, &[lp.portfolio]);
+    let paid = env.bond_execute(&f, lp.portfolio, 0).expect("farmer 110");
+    let profit = paid as i128 - (3_000 * U) as i128;
+    eprintln!("GH571 farm: control {} incumbents {} newcomer paid {} profit {}", c.coupon, incumbents, paid, profit);
+    assert!(profit < c.coupon as i128, "the newcomer's take is bounded by the incumbents' unpaid accrual");
+    env.assert_conserved("gh571 farm exit");
+}

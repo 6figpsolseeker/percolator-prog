@@ -964,3 +964,206 @@ proptest! {
         let _ = coupons;
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// Issue #571: the coupon checkpoint across bond deposits (108) and redemptions (110) between
+// two harvests (78). Spec: a 108 carries the accrued area onto the new C_b
+// (`coupon_checkpoint_after_deposit`); a 110 leaves the checkpoint alone, so the exiter's unpaid
+// accrual is forfeited (non-cumulative, I-T7) and the rest is paid on the remaining base.
+// Holder 0 is an incumbent that never acts; holders 1-2 are incumbents that may exit; every
+// deposit makes a new holder.
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+
+#[derive(Clone, Debug)]
+enum Iv {
+    Wait(u64),
+    Deposit(u128),
+    Dust,
+    Exit(u8, u8),
+}
+
+fn iv(exits: bool) -> impl Strategy<Value = Iv> {
+    prop_oneof![
+        3 => (0u64..=400_000).prop_map(Iv::Wait),
+        2 => (1u128..(1u128 << 40)).prop_map(Iv::Deposit),
+        2 => Just(Iv::Dust),
+        2 => (1u8..=2, 1u8..=16).prop_map(move |(i, k)| if exits { Iv::Exit(i, k) } else { Iv::Wait(0) }),
+    ]
+}
+
+/// Runs one harvest interval [t0, harvest] and checks the spec. `p3` = also check the farming
+/// bound per newcomer (deposit-only sequences, where the share price stays exactly 1).
+fn interval_case(init: [u128; 3], rate: u32, seq: Vec<Iv>, p3: bool) -> Result<(), TestCaseError> {
+    let y = SLOTS_PER_YEAR as u64;
+    let k = (BPS * SLOTS_PER_YEAR) as f64;
+    let r = rate as f64;
+    let t0 = 2 * y; // a mature chain: no saturation at `now - shift`
+    let (mut now, mut ck) = (t0, t0);
+    let (mut c, mut b) = (0u128, 0u128);
+    let mut sh: Vec<u128> = Vec::new();
+    // per-holder: (deposit amount, deposit slot); incumbents have slot t0
+    let mut entry: Vec<(u128, u64)> = Vec::new();
+    for x in init {
+        let m = bond_shares_for_deposit(x, b, c).unwrap();
+        c += x;
+        b += m;
+        sh.push(m);
+        entry.push((x, t0));
+    }
+    let mut area_pool: u128 = 0; // exact integral of C_b dt
+    let mut area_h: Vec<f64> = vec![0.0; sh.len()]; // integral of each holder's claim dt
+    let mut slack: u128 = 0; // sum of c_new over resize events (ceil rounding bound)
+    let mut capped = false;
+    let mut exited = false; // a 110 forfeits the exiter's accrual: no lower bound on the pool
+    for op in seq {
+        let c_old = c;
+        match op {
+            Iv::Wait(dt) => {
+                area_pool += c * dt as u128;
+                for (i, s) in sh.iter().enumerate() {
+                    area_h[i] += *s as f64 * c as f64 / b as f64 * dt as f64;
+                }
+                now += dt;
+                continue;
+            }
+            Iv::Deposit(_) | Iv::Dust => {
+                let a = match op {
+                    Iv::Deposit(a) => a,
+                    _ => c / b + (c % b != 0) as u128, // smallest amount minting one share
+                };
+                let m = bond_shares_for_deposit(a, b, c).unwrap(); // whole tranche: value == C_b
+                if m == 0 {
+                    continue;
+                }
+                c += a;
+                b += m;
+                sh.push(m);
+                area_h.push(0.0);
+                entry.push((a, now));
+            }
+            Iv::Exit(i, q) => {
+                let i = i as usize;
+                let s = sh[i] * q as u128 / 16;
+                if s == 0 || s == b {
+                    continue;
+                }
+                c = bond_claim_after_redemption(c, s, b).unwrap();
+                b -= s;
+                sh[i] -= s;
+                // #571: tag 110 does not touch the checkpoint (and adds no ceil slack)
+                exited = true;
+                continue;
+            }
+        }
+        if now > ck {
+            let dt = (now - ck) as u128;
+            if c_old * dt > c * SLOTS_PER_YEAR {
+                capped = true;
+            }
+            slack += c;
+        }
+        let ck2 = coupon_checkpoint_after_deposit(ck, now, c_old, c).unwrap();
+        prop_assert!(ck2 <= now.max(ck) && ck2 + y >= now, "checkpoint within [now - 1y, now]");
+        if c >= c_old {
+            prop_assert!(ck2 >= ck, "a deposit never moves the checkpoint back");
+        }
+        ck = ck2;
+    }
+    // ── the harvest ──
+    let repr = c * (now - ck) as u128; // what tag 78 charges: C_b * (now - checkpoint)
+    // P1: the remainder of the leg pays the integral of the capital actually outstanding, rounded
+    // up by < one slot of C_b per 108/110 (lower bound unless the 1y shift cap bit).
+    prop_assert!(repr <= area_pool + slack, "remainder overcharged: {} > {} + {}", repr, area_pool, slack);
+    if !capped && !exited {
+        prop_assert!(repr >= area_pool, "bonds undercharged: {} < {}", repr, area_pool);
+    }
+    let due = coupon_due(c, rate, now - ck).unwrap();
+    prop_assert_eq!(due, mul_div_floor(repr * rate as u128, 1, BPS * SLOTS_PER_YEAR).unwrap());
+    // half-leg cap (M-2) and I-T7 are unchanged: the leg pays min(due, leg / 2)
+    let leg = 2 * due + 1;
+    let (coupon, _) = bond_coupon_split(leg, due);
+    prop_assert_eq!(coupon, due);
+    let got = |i: usize| sh[i] as f64 * coupon as f64 / b as f64;
+    // backdate[i] = sum over later depositors of a_k * (t_k - t0): the coupon area newcomers'
+    // shares can take from the incumbents (at most what their own money would have earned had it
+    // been deposited at the last harvest)
+    let backdate: f64 = entry.iter().skip(3).map(|(a, t)| *a as f64 * (*t - t0) as f64).sum();
+    // P2 (dust / griefing): the incumbent that never acts loses at most its share of `backdate`
+    // (an exit leaves it unchanged: the remaining base accrues over the whole interval); a dust deposit is a dust loss, never the interval.
+    let ideal0 = r * area_h[0] / k;
+    let floor0 = ideal0 - r * (sh[0] as f64 / b as f64) * backdate / k - 2.0;
+    if !capped {
+        prop_assert!(got(0) >= floor0, "incumbent coupon {} < bound {} (ideal {})", got(0), floor0, ideal0);
+        // the pool total is the integral only without exits (an exiter's accrual is forfeited)
+        if !exited {
+            let total: f64 = (0..sh.len()).map(got).sum();
+            prop_assert!(total + sh.len() as f64 >= r * area_pool as f64 / k - 2.0);
+        }
+    }
+    // P3 (farming): a newcomer earns at most the coupon on its own amount since the LAST HARVEST
+    // (not since its deposit) plus its share of the rounding; the excess comes out of the
+    // incumbents (P2), never the remainder (P1).
+    if p3 {
+        for i in 3..sh.len() {
+            let (a, _) = entry[i];
+            let cap = r * (a as f64 * (now - t0) as f64 + sh[i] as f64 / b as f64 * slack as f64) / k + 2.0;
+            prop_assert!(got(i) <= cap, "newcomer {} took {} > {}", i, got(i), cap);
+        }
+    }
+    Ok(())
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 4_096, .. ProptestConfig::default() })]
+
+    #[test]
+    fn i571_coupon_checkpoint_across_deposits_and_exits(
+        init in [(1u128 << 20)..(1u128 << 40), 1u128..(1u128 << 40), 1u128..(1u128 << 40)],
+        rate in 1u32..=BOND_COUPON_MAX_BPS as u32,
+        seq in prop::collection::vec(iv(true), 1..48),
+    ) {
+        interval_case(init, rate, seq, false)?;
+    }
+
+    #[test]
+    fn i571_newcomer_farming_bounded(
+        init in [(1u128 << 20)..(1u128 << 40), 1u128..(1u128 << 40), 1u128..(1u128 << 40)],
+        rate in 1u32..=BOND_COUPON_MAX_BPS as u32,
+        seq in prop::collection::vec(iv(false), 1..48),
+    ) {
+        interval_case(init, rate, seq, true)?;
+    }
+
+    /// Helper-level: never past `now`, never more than a year back, a deposit never moves it back,
+    /// a no-op when `C_b` is unchanged.
+    #[test]
+    fn i571_checkpoint_helper_bounds(last in any::<u64>(), now in any::<u64>(), c_old in 0u128..(1u128 << 64), c_new in 0u128..(1u128 << 64)) {
+        let r = coupon_checkpoint_after_deposit(last, now, c_old, c_new);
+        if c_new == 0 || c_new < c_old {
+            prop_assert_eq!(r, None); // unreachable from 108 (c_new = c_old + amount > 0): fail closed
+        } else {
+            let ck = r.unwrap();
+            if now <= last {
+                prop_assert_eq!(ck, last);
+            } else {
+                prop_assert!(ck >= last && ck <= now && (now - ck) as u128 <= SLOTS_PER_YEAR);
+                if c_old == c_new && c_old > 0 && ((now - last) as u128) <= SLOTS_PER_YEAR { prop_assert_eq!(ck, last); }
+            }
+        }
+    }
+}
+
+/// Negative control for P2: the pre-fix rule (`checkpoint = now` on every 108) fails it.
+#[test]
+fn i571_old_reset_rule_fails_p2() {
+    let (c_old, dt) = (3_000_000_000u128, 500_000u64);
+    let with_fix = c_old + 2;
+    let y = SLOTS_PER_YEAR as u64;
+    let now = 2 * y + dt;
+    let ck = coupon_checkpoint_after_deposit(now - dt, now, c_old, with_fix).unwrap();
+    let fixed = coupon_due(with_fix, 2_000, now + 1 - ck).unwrap();
+    let reset = coupon_due(with_fix, 2_000, 1).unwrap();
+    let control = coupon_due(c_old, 2_000, dt + 1).unwrap();
+    assert!(fixed >= control && fixed <= control + 1, "fixed {fixed} control {control}");
+    assert!(reset * 1_000 < control, "old rule forfeits the interval: {reset} vs {control}");
+}

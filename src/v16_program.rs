@@ -7095,8 +7095,10 @@ pub mod state {
         /// Informational mirror of the impairment (`C_b - bond value`) observed the last time a
         /// bond instruction priced the tranche. Nothing prices off it.
         pub bond_drawn_outstanding_atoms: u128, // 80..96
-        /// Coupon checkpoint. Reset to "now" by every coupon crank (non-cumulative) and by every
-        /// 108/110 (which require the fee leg harvested first, so nothing earned is forfeited).
+        /// Coupon checkpoint. Reset to "now" by every coupon crank (non-cumulative, I-T7). Tag 108
+        /// moves it only by the deposit's weight (`bond_v20::coupon_checkpoint_after_deposit`);
+        /// tag 110 leaves it alone (GH#571: the coupon is time-based and unpaid until the next
+        /// crank, so a reset here forfeited every holder's accrual).
         pub last_coupon_slot: u64, // 96..104
         pub coupon_bps_per_year: u16,   // 104..106
         pub coupon_util_bonus_bps: u16, // 106..108
@@ -41705,6 +41707,7 @@ pub mod processor {
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
         state::write_bond_position(&mut position_ai.try_borrow_mut_data()?, &pos)?;
         let amount = amount as u128;
+        let c_b_before = t.c_b_atoms;
         t.c_b_atoms = t
             .c_b_atoms
             .checked_add(amount)
@@ -41717,11 +41720,12 @@ pub mod processor {
             .principal_in_lp_atoms
             .checked_add(amount)
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-        // The fee leg was harvested (refused otherwise), so moving the checkpoint forfeits
-        // nothing earned; the newcomer accrues coupon only from now (no coupon farming).
-        if now > t.last_coupon_slot {
-            t.last_coupon_slot = now;
-        }
+        // GH#571: the coupon accrued since the last crank is unpaid (it is time-based, paid only
+        // by tag 78), so the checkpoint keeps the incumbents' capital-slots on the new base and
+        // the new capital accrues from now. A reset forfeited it all for a 1-atom deposit.
+        t.last_coupon_slot =
+            bond_v20::coupon_checkpoint_after_deposit(t.last_coupon_slot, now, c_b_before, t.c_b_atoms)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
         t.bond_drawn_outstanding_atoms = 0;
         state::write_bond_tranche(&mut tranche_ai.try_borrow_mut_data()?, &t)?;
         solana_program::log::sol_log(&alloc::format!(
@@ -42019,10 +42023,8 @@ pub mod processor {
         if mode == MarketModeV16::Live {
             t.principal_in_lp_atoms = t.principal_in_lp_atoms.saturating_sub(payout);
         }
-        // 110 requires the fee leg harvested (refused otherwise): nothing earned is forfeited.
-        if now > t.last_coupon_slot {
-            t.last_coupon_slot = now;
-        }
+        // #571: the checkpoint stays. The remaining base accrues over the whole interval, which
+        // is exactly its share; the exiter's unpaid accrual is not paid (non-cumulative, I-T7).
         t.bond_drawn_outstanding_atoms = if t.c_b_atoms == 0 { 0 } else { impairment };
         state::write_bond_tranche(&mut tranche_ai.try_borrow_mut_data()?, &t)?;
         pos.shares = pos

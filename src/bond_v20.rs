@@ -298,6 +298,31 @@ pub fn coupon_due(bond_claim: u128, rate_bps: u32, dslots: u64) -> Option<u128> 
     mul_div_floor(num, dt, BPS.checked_mul(SLOTS_PER_YEAR)?)
 }
 
+/// Coupon checkpoint after a deposit (tag 108) raises `C_b` from `c_old` to `c_new` (GH#571).
+///
+/// The coupon owed for an interval is `C_b x rate x slots`, and nothing pays it until the next
+/// tag 78 harvests a fee leg; resetting the checkpoint to `now` here forfeited every holder's
+/// accrual since that harvest, so a 1-atom deposit zeroed it. Instead the checkpoint moves so the
+/// accrued capital-slots are kept on the larger base and the newcomer's capital accrues from
+/// now: `now - ceil(c_old * min(now - last, 1y) / c_new)`. Rounding UP keeps the incumbents'
+/// accrual (a deposit with `amount * dt < c_new` leaves the checkpoint where it is); the
+/// result is never earlier than `last`, so a deposit can never lengthen the interval.
+/// `c_old == 0` (genesis or after a full exit) gives `now`. `None` when `c_new < c_old` or
+/// `c_new == 0` (corrupt) or on overflow.
+pub fn coupon_checkpoint_after_deposit(last: u64, now: u64, c_old: u128, c_new: u128) -> Option<u64> {
+    if c_new == 0 || c_new < c_old {
+        return None;
+    }
+    if now <= last {
+        return Some(last);
+    }
+    let dt = core::cmp::min((now - last) as u128, SLOTS_PER_YEAR);
+    let num = c_old.checked_mul(dt)?;
+    let kept = num / c_new + u128::from(num % c_new != 0);
+    // kept <= dt <= now - last, so the subtraction stays in [last, now].
+    Some(now - kept as u64)
+}
+
 /// Coupon gate: paid only on a Live market, from a non-empty tranche, while NO senior principal
 /// loss is outstanding (the coupon never takes priority over Earn principal) AND while the bond
 /// tranche itself is whole (`bond_value >= C_b`, security review M-1): an impaired tranche earns
@@ -413,6 +438,47 @@ pub fn bond_impairment(vault_value: u128, senior_claim: u128, bond_claim: u128) 
 mod tests {
     use super::*;
     use crate::vault_lp_v18::{alloc_junior_ok, junior_withdraw_allowed, tranche_split};
+
+    #[test]
+    fn gh571_deposit_checkpoint_keeps_incumbent_accrual() {
+        let y = SLOTS_PER_YEAR as u64;
+        let accrued = |last: u64, now: u64, c: u128| c * core::cmp::min((now - last) as u128, SLOTS_PER_YEAR);
+        // dust: checkpoint untouched (the bug reset it to `now`)
+        assert_eq!(coupon_checkpoint_after_deposit(1_000, 501_000, 3_000_000_000, 3_000_000_002), Some(1_000));
+        // genesis / after a full exit: accrue from now
+        assert_eq!(coupon_checkpoint_after_deposit(1_000, 501_000, 0, 5), Some(501_000));
+        // equal deposit halves the remaining interval on the doubled base
+        assert_eq!(coupon_checkpoint_after_deposit(0, 1_000, 100, 200), Some(500));
+        // no time elapsed / clock behind the checkpoint: never moves backwards
+        assert_eq!(coupon_checkpoint_after_deposit(1_000, 1_000, 100, 200), Some(1_000));
+        assert_eq!(coupon_checkpoint_after_deposit(1_000, 900, 100, 200), Some(1_000));
+        // idle beyond the 1y clamp: the clamped accrual is kept, never more
+        assert_eq!(coupon_checkpoint_after_deposit(0, 3 * y, 7, 7), Some(2 * y));
+        // ceil: 1,000 * 3 / 1,001 = 2.997 -> keep 3 slots; one deposit per slot keeps its slot
+        assert_eq!(coupon_checkpoint_after_deposit(0, 3, 1_000, 1_001), Some(0));
+        assert_eq!(coupon_checkpoint_after_deposit(99, 100, 1, u128::MAX), Some(99));
+        assert_eq!(coupon_checkpoint_after_deposit(0, u64::MAX, 1, 1), Some(u64::MAX - y));
+        // corrupt inputs fail closed
+        assert_eq!(coupon_checkpoint_after_deposit(0, 10, 200, 100), None);
+        assert_eq!(coupon_checkpoint_after_deposit(0, 10, 0, 0), None);
+        assert_eq!(coupon_checkpoint_after_deposit(0, 10, u128::MAX, u128::MAX), None);
+        // property sweep: capital-slots kept in [exact, exact + c_new), checkpoint in [last, now]
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        for _ in 0..20_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let last = x % 1_000_000;
+            let now = last + (x >> 20) % (2 * y);
+            let c_old = ((x >> 3) % 1_000_000_000_000) as u128;
+            let c_new = c_old + 1 + ((x >> 11) % 1_000_000_000_000) as u128;
+            let s = coupon_checkpoint_after_deposit(last, now, c_old, c_new).unwrap();
+            assert!(last <= s && s <= now);
+            let kept = c_new * (now - s) as u128;
+            let exact = accrued(last, now, c_old);
+            assert!(kept >= exact && kept < exact + c_new, "last={last} now={now} c_old={c_old} c_new={c_new} s={s}");
+        }
+    }
 
     #[test]
     fn split3_examples_and_two_tranche_equivalence() {
